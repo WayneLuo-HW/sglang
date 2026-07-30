@@ -129,10 +129,14 @@ DEFAULT_BCG_TEXT_BUCKETS = (64, 128, 256, 512, 1024)
 BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
     {
         "comfy-org/ideogram-4",
+        "fal/ideogram-v4-fast",
+        "fal/ideogram-v4-instant",
         "glm-image",
         "ideogram-4",
         "ideogram-4-fp8",
         "ideogram-4-nf4",
+        "ideogram-v4-fast",
+        "ideogram-v4-instant",
         "ideogram-ai/ideogram-4-fp8",
         "ideogram-ai/ideogram-4-nf4",
         "qwen/qwen-image",
@@ -264,6 +268,8 @@ class ServerArgs(DisaggServerArgsMixin):
     dit_layerwise_offload: bool | None = None
     layerwise_offload_components: list[str] | None = None
     dit_offload_prefetch_size: float = 0.0
+    # If set, keep this many leading DiT layers resident on GPU
+    dit_layerwise_resident_layers: float = 0.0
     offload_during_compile: bool = True
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
@@ -278,6 +284,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Compilation
     enable_torch_compile: bool = False
+    regional_compile: bool = False
 
     # Breakable CUDA graph (BCG): capture the DiT forward as CUDA-graph
     # segments split at attention modules (SP all-to-all / dynamic attention
@@ -421,6 +428,9 @@ class ServerArgs(DisaggServerArgsMixin):
     srt_encoder_url: str | None = None
     srt_encoder_connect_timeout: int = 3.05
     srt_encoder_timeout: int = 100
+
+    # SGLang server for PE model inference
+    pe_server_url: str | None = None
 
     @property
     def broker_port(self) -> int:
@@ -615,6 +625,17 @@ class ServerArgs(DisaggServerArgsMixin):
             # CPU platform does not need offload
             return
 
+        if self.pipeline_config.task_type.is_action_gen():
+            if self.dit_cpu_offload is None:
+                self.dit_cpu_offload = False
+            if self.text_encoder_cpu_offload is None:
+                self.text_encoder_cpu_offload = False
+            if self.image_encoder_cpu_offload is None:
+                self.image_encoder_cpu_offload = False
+            if self.vae_cpu_offload is None:
+                self.vae_cpu_offload = False
+            return
+
         # TODO: to be handled by each platform
         if current_platform.get_device_total_memory() / BYTES_PER_GB < 30:
             logger.info(
@@ -784,6 +805,8 @@ class ServerArgs(DisaggServerArgsMixin):
         normalized = backend.strip().lower()
         if normalized in ("fa3", "fa4"):
             normalized = "fa"
+        elif normalized == "cudnn_sdpa":
+            normalized = "torch_cudnn_sdpa"
         try:
             return AttentionBackendEnum[normalized.upper()].name.lower()
         except KeyError:
@@ -1106,6 +1129,20 @@ class ServerArgs(DisaggServerArgsMixin):
             self.use_fsdp_inference = False
             self.dit_layerwise_offload = False
             self.layerwise_offload_components = None
+            if (
+                self.dit_cpu_offload
+                or self.text_encoder_cpu_offload
+                or self.image_encoder_cpu_offload
+                or self.vae_cpu_offload
+            ):
+                logger.warning(
+                    "Disabling component CPU offload on MPS because the component "
+                    "residency offload strategy is only validated on CUDA."
+                )
+            self.dit_cpu_offload = False
+            self.text_encoder_cpu_offload = False
+            self.image_encoder_cpu_offload = False
+            self.vae_cpu_offload = False
 
     def is_arg_explicitly_set(self, arg_name: str) -> bool:
         return arg_name in self._explicit_arg_names
@@ -1283,12 +1320,14 @@ class ServerArgs(DisaggServerArgsMixin):
             ),
         )
         parser.add_argument(
+            "--pipeline",
             "--pipeline-class-name",
+            dest="pipeline_class_name",
             type=str,
             default=ServerArgs.pipeline_class_name,
             help=(
-                "Override pipeline class selection from model_index.json. "
-                "Must match a registered pipeline_name."
+                "Advanced override for pipeline class selection from the model registry "
+                "or model_index.json. Must match a registered pipeline_name."
             ),
         )
         # attention
@@ -1476,6 +1515,16 @@ class ServerArgs(DisaggServerArgsMixin):
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
         )
         parser.add_argument(
+            "--regional-compile",
+            action=StoreBoolean,
+            default=ServerArgs.regional_compile,
+            help=(
+                "Compile repeated DiT submodules selected by the model's "
+                "_compile_conditions instead of compiling the whole transformer. "
+                "Requires --enable-torch-compile."
+            ),
+        )
+        parser.add_argument(
             "--offload-during-compile",
             action=StoreBoolean,
             default=ServerArgs.offload_during_compile,
@@ -1601,6 +1650,18 @@ class ServerArgs(DisaggServerArgsMixin):
             type=float,
             default=ServerArgs.dit_offload_prefetch_size,
             help="The size of prefetch for dit-layerwise-offload. If the value is between 0.0 and 1.0, it is treated as a ratio of the total number of layers. If the value is >= 1, it is treated as the absolute number of layers. 0.0 means prefetch 1 layer (lowest memory). Values above 0.5 might have peak memory close to no offload but worse performance.",
+        )
+        parser.add_argument(
+            "--dit-layerwise-resident-layers",
+            type=float,
+            default=ServerArgs.dit_layerwise_resident_layers,
+            help="With --dit-layerwise-offload, keep this many leading DiT layers "
+            "permanently resident on GPU (retained across denoise steps) and stream "
+            "only the tail with --dit-offload-prefetch-size. 0.0 = off (pure "
+            "streaming). Between 0.0 and 1.0 = ratio of layers; >= 1 = absolute "
+            "count. Unlike raising the prefetch size, resident layers are transferred "
+            "once (not re-streamed every step), so this trades VRAM for lower denoise "
+            "latency when memory is available.",
         )
 
         # offload flags
@@ -1907,6 +1968,14 @@ class ServerArgs(DisaggServerArgsMixin):
             "Increase value if connection between diffusion server and AR model server is slow.",
         )
 
+        # SGLang server for PE model inference
+        parser.add_argument(
+            "--pe-server-url",
+            type=str,
+            default=ServerArgs.pe_server_url,
+            help="URL of SGLang server for PE model",
+        )
+
         return parser
 
     def url(self):
@@ -2173,7 +2242,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
         # Create a set of argument names that were present on the command line.
         # This handles both styles: '--arg=value' and '--arg value'.
-        provided_arg_names = set()
+        provided_arg_names = set(getattr(args, "_sglang_explicit_arg_names", ()))
         for arg in raw_argv:
             if arg.startswith("--"):
                 # For '--arg=value', this gets 'arg'; for '--arg', this also gets 'arg'.
@@ -2192,6 +2261,8 @@ class ServerArgs(DisaggServerArgsMixin):
 
         # Populate provided_args if the argument from the namespace was on the command line.
         for k, v in vars(args).items():
+            if k.startswith("_sglang_"):
+                continue
             if k in provided_arg_names:
                 provided_args[k] = v
 
@@ -2219,6 +2290,30 @@ class ServerArgs(DisaggServerArgsMixin):
         if 0.5 <= self.dit_offload_prefetch_size < 1.0:
             logger.info(
                 "We do not recommend --dit-offload-prefetch-size to be between 0.5 and 1.0"
+            )
+
+        # validate dit_layerwise_resident_layers (same ratio/absolute convention)
+        if self.dit_layerwise_resident_layers < 0.0:
+            raise ValueError("dit_layerwise_resident_layers must be non-negative")
+        if self.dit_layerwise_resident_layers >= 1 and (
+            isinstance(self.dit_layerwise_resident_layers, float)
+            and not self.dit_layerwise_resident_layers.is_integer()
+        ):
+            self.dit_layerwise_resident_layers = int(
+                math.floor(self.dit_layerwise_resident_layers)
+            )
+            logger.info(
+                "Invalid --dit-layerwise-resident-layers value passed, truncated to: "
+                f"{self.dit_layerwise_resident_layers}"
+            )
+        if (
+            self.dit_layerwise_resident_layers > 0
+            and not self.is_dit_layerwise_offload_selected
+        ):
+            logger.warning(
+                "--dit-layerwise-resident-layers has no effect because the DiT is not "
+                "layerwise-offloaded. It only applies together with "
+                "--dit-layerwise-offload (or 'dit' in --layerwise-offload-components)."
             )
 
         # validate layerwise offload conflicts

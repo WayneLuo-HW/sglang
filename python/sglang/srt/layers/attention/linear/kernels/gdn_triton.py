@@ -20,10 +20,10 @@ if not is_cpu():
     )
 
 if is_npu():
-    from sgl_kernel_npu.fla.chunk import chunk_gated_delta_rule_npu
     from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent_decode_optimized import (
         fused_sigmoid_gating_delta_rule_update_decode_npu as fused_sigmoid_gating_delta_rule_update,
     )
+    from sgl_kernel_npu.operators.attention.gdn import chunk_gated_delta_rule_npu
 
     chunk_gated_delta_rule = chunk_gated_delta_rule_npu
 elif is_cpu():
@@ -188,6 +188,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
         inplace_update_args = {"inplace_update": inplace_update}
+        impl_args = {}
         output_args = {}
         if (out is None) != (output_indices is None):
             raise ValueError("out and output_indices must be supplied together")
@@ -220,6 +221,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             # The external NPU kernel does not expose the optional write-back
             # control. Its existing behavior is equivalent to True.
             inplace_update_args = {}
+            impl_args = {"impl": "auto"}
 
         return chunk_gated_delta_rule(
             q=q,
@@ -233,6 +235,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             **recurrent_state_indices_args,
             **inplace_update_args,
+            **impl_args,
             **graph_table_args,
             **output_args,
         )
